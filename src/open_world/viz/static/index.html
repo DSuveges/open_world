@@ -1,0 +1,534 @@
+<title>open-world map viewer</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115;
+    --panel: #1a1d24;
+    --border: #2c313c;
+    --text: #e6e8eb;
+    --muted: #9aa1ab;
+    --ok: #4caf7d;
+    --bad: #e05a5a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--text);
+    font: 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  #app { display: flex; height: 100%; }
+  #canvas-wrap { position: relative; flex: 1; }
+  canvas { display: block; width: 100%; height: 100%; cursor: grab; }
+  #sidebar {
+    width: 300px;
+    flex-shrink: 0;
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    padding: 16px;
+    overflow-y: auto;
+  }
+  h1 { font-size: 14px; margin: 0 0 12px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 18px 0 8px; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  .swatch { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+  .stat { display: flex; justify-content: space-between; gap: 8px; margin: 3px 0; }
+  .stat .v { color: var(--muted); text-align: right; }
+  .badge { padding: 2px 6px; border-radius: 3px; font-weight: 600; font-size: 11px; }
+  .badge.ok { background: color-mix(in srgb, var(--ok) 25%, transparent); color: var(--ok); }
+  .badge.bad { background: color-mix(in srgb, var(--bad) 25%, transparent); color: var(--bad); }
+  label { display: flex; align-items: center; gap: 6px; cursor: pointer; margin: 4px 0; }
+  select { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); padding: 4px; border-radius: 4px; }
+  #legend { max-height: 180px; overflow-y: auto; }
+  .legend-row { cursor: pointer; padding: 2px 4px; border-radius: 3px; }
+  .legend-row:hover { background: rgba(255, 255, 255, 0.06); }
+  .legend-row.active { background: rgba(255, 255, 255, 0.12); font-weight: 600; }
+  #legend-hint { color: var(--muted); font-size: 11px; margin: 4px 0 8px; }
+  #status { position: absolute; top: 10px; left: 12px; color: var(--muted); font-size: 12px; }
+  ul { margin: 4px 0; padding-left: 16px; color: var(--muted); }
+  details { margin: 4px 0; }
+  summary { cursor: pointer; color: var(--muted); }
+  .view-toggle { display: flex; gap: 4px; margin: 4px 0 8px; }
+  .view-toggle button {
+    flex: 1;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .view-toggle button.active { background: color-mix(in srgb, var(--ok) 20%, var(--bg)); border-color: var(--ok); }
+  #gradient-bar {
+    height: 14px;
+    border-radius: 3px;
+    margin: 6px 0 4px;
+  }
+  #gradient-labels { display: flex; justify-content: space-between; color: var(--muted); font-size: 11px; }
+  #tooltip {
+    position: absolute;
+    display: none;
+    pointer-events: none;
+    background: rgba(20, 22, 28, 0.95);
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    padding: 6px 9px;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: nowrap;
+    z-index: 10;
+  }
+  #tooltip .name { font-weight: 600; }
+  #tooltip .sub { color: var(--muted); }
+</style>
+<div id="app">
+  <div id="canvas-wrap">
+    <canvas id="canvas"></canvas>
+    <div id="status">loading&hellip;</div>
+    <div id="tooltip"></div>
+  </div>
+  <div id="sidebar">
+    <h1>open-world map viewer</h1>
+
+    <h2>View</h2>
+    <div class="view-toggle">
+      <button id="view-terrain" class="active">terrain map</button>
+      <button id="view-graph">graph diagnostic</button>
+    </div>
+
+    <h2>Graph</h2>
+    <div class="stat"><span>nodes</span><span class="v" id="stat-nodes">-</span></div>
+    <div class="stat"><span>edges</span><span class="v" id="stat-edges">-</span></div>
+    <div class="stat"><span>validity</span><span class="v" id="stat-valid">-</span></div>
+    <div id="issues"></div>
+
+    <h2>Metrics</h2>
+    <div class="stat"><span>avg degree</span><span class="v" id="m-avg-degree">-</span></div>
+    <div class="stat"><span>degree p50 / p90 / max</span><span class="v" id="m-degree-pct">-</span></div>
+    <details>
+      <summary>edges by kind</summary>
+      <div id="m-edge-kinds"></div>
+    </details>
+    <details>
+      <summary>mean elevation gap by kind</summary>
+      <div id="m-elev-gap"></div>
+    </details>
+    <div class="stat"><span>edges crossing province</span><span class="v" id="m-aff-prov">-</span></div>
+    <div class="stat"><span>edges crossing state</span><span class="v" id="m-aff-state">-</span></div>
+    <div class="stat"><span>high-elevation threshold</span><span class="v" id="m-high-thresh">-</span></div>
+    <div class="stat"><span>high-elevation clusters</span><span class="v" id="m-high-clusters">-</span></div>
+    <div class="stat"><span>&hellip;crossing &gt;1 state</span><span class="v" id="m-high-cross-state">-</span></div>
+
+    <div id="graph-controls">
+      <h2>Display</h2>
+      <label>color by
+        <select id="color-by">
+          <option value="state">state</option>
+          <option value="province">province</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="toggle-same-province" checked /> same-province edges</label>
+      <label><input type="checkbox" id="toggle-boundary" checked /> province/state-crossing edges</label>
+    </div>
+
+    <h2>Legend</h2>
+    <div id="legend-hint">click an entry to isolate it, click again to reset</div>
+    <div id="legend"></div>
+  </div>
+</div>
+
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<script>
+"use strict";
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const status = document.getElementById("status");
+const tooltip = document.getElementById("tooltip");
+
+const HEX_SIZE = 1;
+const TERRAIN_STOPS = [0, 0.12, 0.35, 0.6, 0.82, 1];
+const TERRAIN_COLORS = ["#1f6f4a", "#4f8c3f", "#9c9350", "#8a6a49", "#6b5646", "#f4f4f2"];
+const WATER_COLOR = "#081522";
+
+const state = {
+  data: null,
+  viewMode: "terrain",
+  colorBy: "state",
+  showSameProvince: true,
+  showBoundary: true,
+  graphTransform: d3.zoomIdentity,
+  terrainTransform: d3.zoomIdentity,
+  highlight: null,
+};
+
+function resize() {
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  canvas.style.width = rect.width + "px";
+  canvas.style.height = rect.height + "px";
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", () => { resize(); draw(); });
+
+function colorScaleFor(key, nodes) {
+  const values = Array.from(new Set(nodes.map((n) => n[key]))).sort();
+  const colors = d3.quantize((t) => d3.interpolateRainbow(t), Math.max(values.length, 3));
+  return d3.scaleOrdinal().domain(values).range(colors);
+}
+
+const terrainScale = d3.scaleLinear()
+  .domain(TERRAIN_STOPS)
+  .range(TERRAIN_COLORS)
+  .interpolate(d3.interpolateRgb);
+
+/** Elevation is heavily right-skewed, so colour by percentile rank rather
+ *  than raw value -- otherwise almost everything would land in one narrow
+ *  band of the ramp and the map would look flat. */
+function assignElevationPercentiles(nodes) {
+  const sorted = [...nodes].sort((a, b) => a.elevation - b.elevation);
+  const denom = Math.max(sorted.length - 1, 1);
+  sorted.forEach((n, i) => { n._pct = i / denom; });
+}
+
+function hexToPixel(q, r) {
+  return [HEX_SIZE * Math.sqrt(3) * (q + r / 2), HEX_SIZE * 1.5 * r];
+}
+
+function drawHexagon(cx, cy, size) {
+  ctx.beginPath();
+  for (let i = 0; i < 6; i++) {
+    const angle = (Math.PI / 180) * (60 * i - 30);
+    const px = cx + size * Math.cos(angle);
+    const py = cy + size * Math.sin(angle);
+    if (i === 0) ctx.moveTo(px, py);
+    else ctx.lineTo(px, py);
+  }
+  ctx.closePath();
+}
+
+function buildLegend(scale) {
+  const legend = document.getElementById("legend");
+  const hint = document.getElementById("legend-hint");
+  hint.style.display = "";
+  legend.innerHTML = "";
+  for (const value of scale.domain()) {
+    const row = document.createElement("div");
+    row.className = "row legend-row" + (state.highlight === value ? " active" : "");
+    row.innerHTML = `<span class="swatch" style="background:${scale(value)}"></span><span>${value}</span>`;
+    row.addEventListener("click", () => {
+      state.highlight = state.highlight === value ? null : value;
+      buildLegend(scale);
+      draw();
+    });
+    legend.appendChild(row);
+  }
+}
+
+function buildTerrainLegend(nodes) {
+  document.getElementById("legend-hint").style.display = "none";
+  const legend = document.getElementById("legend");
+  const gradientCss = TERRAIN_STOPS.map(
+    (stop, i) => `${TERRAIN_COLORS[i]} ${(stop * 100).toFixed(0)}%`
+  ).join(", ");
+  const elevations = nodes.map((n) => n.elevation);
+  const lo = Math.min(...elevations), hi = Math.max(...elevations);
+  legend.innerHTML = `
+    <div id="gradient-bar" style="background: linear-gradient(90deg, ${gradientCss})"></div>
+    <div id="gradient-labels"><span>${lo} m</span><span>${hi} m</span></div>
+    <div style="color: var(--muted); font-size: 11px; margin-top: 8px;">
+      coloured by elevation percentile rank (skewed data), not raw metres
+    </div>`;
+}
+
+function renderSummary(summary, nodeCount, edgeCount) {
+  document.getElementById("stat-nodes").textContent = nodeCount.toLocaleString();
+  document.getElementById("stat-edges").textContent = edgeCount.toLocaleString();
+  const validEl = document.getElementById("stat-valid");
+  validEl.innerHTML = summary.is_valid
+    ? '<span class="badge ok">valid</span>'
+    : '<span class="badge bad">invalid</span>';
+
+  const issues = document.getElementById("issues");
+  issues.innerHTML = "";
+  const lists = [
+    ["disconnected provinces", summary.disconnected_provinces],
+    ["disconnected states", summary.disconnected_states],
+    ["orphan districts", summary.orphan_districts],
+  ];
+  for (const [label, items] of lists) {
+    if (items && items.length) {
+      const block = document.createElement("div");
+      block.innerHTML = `<strong>${label}</strong> (${items.length})<ul>${items
+        .slice(0, 10)
+        .map((i) => `<li>${i}</li>`)
+        .join("")}</ul>`;
+      issues.appendChild(block);
+    }
+  }
+  if (summary.high_degree_count) {
+    const block = document.createElement("div");
+    block.innerHTML = `<strong>high-degree districts</strong>: ${summary.high_degree_count}`;
+    issues.appendChild(block);
+  }
+}
+
+function renderMetrics(metrics) {
+  document.getElementById("m-avg-degree").textContent = metrics.avg_degree.toFixed(2);
+  const p = metrics.degree_percentiles;
+  document.getElementById("m-degree-pct").textContent = `${p.p50} / ${p.p90} / ${p.max}`;
+
+  const edgeKinds = document.getElementById("m-edge-kinds");
+  edgeKinds.innerHTML = Object.entries(metrics.edge_kind_counts)
+    .map(([kind, count]) => `<div class="stat"><span>${kind}</span><span class="v">${count.toLocaleString()}</span></div>`)
+    .join("");
+
+  const elevGap = document.getElementById("m-elev-gap");
+  elevGap.innerHTML = Object.entries(metrics.elevation_gap_by_kind)
+    .map(([kind, stats]) => `<div class="stat"><span>${kind}</span><span class="v">${stats.mean.toFixed(1)}</span></div>`)
+    .join("");
+
+  document.getElementById("m-aff-prov").textContent =
+    (metrics.cross_province_fraction * 100).toFixed(0) + "%";
+  document.getElementById("m-aff-state").textContent =
+    (metrics.cross_state_fraction * 100).toFixed(0) + "%";
+  document.getElementById("m-high-thresh").textContent = metrics.high_elevation_threshold.toFixed(0);
+  document.getElementById("m-high-clusters").textContent = metrics.high_elevation_cluster_count;
+  document.getElementById("m-high-cross-state").textContent = metrics.high_elevation_cross_state_cluster_count;
+}
+
+function drawGraphView() {
+  const { nodes, edges } = state.data;
+  const transform = state.graphTransform;
+  ctx.fillStyle = "#0f1115";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.translate(transform.x, transform.y);
+  ctx.scale(transform.k, transform.k);
+
+  const isDimmed = (n) => state.highlight !== null && n[state.colorBy] !== state.highlight;
+
+  // same-province edges are the "local mesh"; everything else crosses a
+  // province or state boundary and gets its own colour so repair edges
+  // (which indicate the randomized pass needed a backstop) stand out.
+  const EDGE_STYLE = {
+    "same-province": { color: "150, 155, 165", opacity: 0.35, dash: [] },
+    "same-state-other-province": { color: "90, 160, 220", opacity: 0.45, dash: [] },
+    "cross-state": { color: "224, 150, 60", opacity: 0.5, dash: [2, 2] },
+    "connectivity-repair": { color: "224, 70, 70", opacity: 0.8, dash: [4, 2] },
+  };
+
+  for (const e of edges) {
+    const isSameProvince = e.kind === "same-province";
+    if (isSameProvince && !state.showSameProvince) continue;
+    if (!isSameProvince && !state.showBoundary) continue;
+    const dimmed = isDimmed(e.source) && isDimmed(e.target);
+    const style = EDGE_STYLE[e.kind] ?? EDGE_STYLE["same-province"];
+    ctx.beginPath();
+    ctx.moveTo(e.source.x, e.source.y);
+    ctx.lineTo(e.target.x, e.target.y);
+    ctx.strokeStyle = `rgba(${style.color}, ${dimmed ? style.opacity * 0.12 : style.opacity})`;
+    ctx.setLineDash(style.dash);
+    ctx.lineWidth = (e.kind === "connectivity-repair" ? 1.5 : 1) / transform.k;
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+
+  const scale = state.colorScale;
+  const radius = 2.5 / transform.k;
+  // draw dimmed nodes first so highlighted ones always render on top
+  const ordered = state.highlight === null ? nodes : [...nodes].sort((a, b) => isDimmed(b) - isDimmed(a));
+  for (const n of ordered) {
+    const dimmed = isDimmed(n);
+    ctx.beginPath();
+    ctx.arc(n.x, n.y, radius, 0, 2 * Math.PI);
+    ctx.globalAlpha = dimmed ? 0.08 : 1;
+    ctx.fillStyle = scale(n[state.colorBy]);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawTerrainView() {
+  const { nodes } = state.data;
+  const transform = state.terrainTransform;
+  ctx.fillStyle = WATER_COLOR;
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.translate(transform.x, transform.y);
+  ctx.scale(transform.k, transform.k);
+
+  // hexes drawn slightly oversized so adjacent tiles touch with no seams
+  const size = HEX_SIZE * 1.02;
+  for (const n of nodes) {
+    drawHexagon(n.hx, n.hy, size);
+    ctx.fillStyle = terrainScale(n._pct);
+    ctx.fill();
+  }
+}
+
+function draw() {
+  if (!state.data) return;
+  const rect = canvas.parentElement.getBoundingClientRect();
+  ctx.save();
+  ctx.clearRect(0, 0, rect.width, rect.height);
+  if (state.viewMode === "terrain") drawTerrainView();
+  else drawGraphView();
+  ctx.restore();
+}
+
+/** Positions come pre-computed from the server (see open_world.layout).
+ *  Edges reference nodes by id; resolve them to objects once so draw() can
+ *  read e.source.x / e.target.x directly. */
+function resolveEdgeEndpoints(nodes, edges) {
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  for (const e of edges) {
+    e.source = byId.get(e.source);
+    e.target = byId.get(e.target);
+  }
+}
+
+function fitTransform(points, width, height, padding = 40, robust = false) {
+  const xs = points.map((p) => p[0]).sort((a, b) => a - b);
+  const ys = points.map((p) => p[1]).sort((a, b) => a - b);
+  const [loQ, hiQ] = robust ? [0.02, 0.98] : [0, 1];
+  const minX = d3.quantile(xs, loQ), maxX = d3.quantile(xs, hiQ);
+  const minY = d3.quantile(ys, loQ), maxY = d3.quantile(ys, hiQ);
+  const scale = Math.min(
+    (width - 2 * padding) / (maxX - minX || 1),
+    (height - 2 * padding) / (maxY - minY || 1)
+  );
+  const tx = width / 2 - scale * (minX + maxX) / 2;
+  const ty = height / 2 - scale * (minY + maxY) / 2;
+  return d3.zoomIdentity.translate(tx, ty).scale(scale);
+}
+
+/** Linear nearest-neighbour search. At ~13k nodes this runs in well under a
+ *  millisecond, so no spatial index is needed for a per-mousemove lookup.
+ *  For the terrain view this is exact (a hex's Voronoi cell is itself, so
+ *  "nearest centre" and "which hex contains this point" are the same
+ *  question); for the graph view it's an approximate hit radius around
+ *  each dot. */
+function findNearestNode(worldX, worldY) {
+  const useHex = state.viewMode === "terrain";
+  let best = null;
+  let bestDistSq = Infinity;
+  for (const n of state.data.nodes) {
+    const nx = useHex ? n.hx : n.x;
+    const ny = useHex ? n.hy : n.y;
+    const dx = nx - worldX;
+    const dy = ny - worldY;
+    const distSq = dx * dx + dy * dy;
+    if (distSq < bestDistSq) {
+      bestDistSq = distSq;
+      best = n;
+    }
+  }
+  return [best, Math.sqrt(bestDistSq)];
+}
+
+function handleHover(event) {
+  if (!state.data) return;
+  const rect = canvas.getBoundingClientRect();
+  const mouseX = event.clientX - rect.left;
+  const mouseY = event.clientY - rect.top;
+  const transform = state.viewMode === "terrain" ? state.terrainTransform : state.graphTransform;
+  const worldX = (mouseX - transform.x) / transform.k;
+  const worldY = (mouseY - transform.y) / transform.k;
+
+  const [node, dist] = findNearestNode(worldX, worldY);
+  const hitRadius = state.viewMode === "terrain" ? HEX_SIZE : (2.5 / transform.k) * 3;
+  if (!node || dist > hitRadius) {
+    tooltip.style.display = "none";
+    return;
+  }
+
+  tooltip.innerHTML =
+    `<div class="name">${node.district}</div>` +
+    `<div class="sub">${node.province}</div>` +
+    `<div class="sub">${node.state}</div>`;
+  tooltip.style.display = "block";
+  tooltip.style.left = mouseX + 14 + "px";
+  tooltip.style.top = mouseY + 14 + "px";
+}
+
+function setViewMode(mode) {
+  state.viewMode = mode;
+  document.getElementById("view-terrain").classList.toggle("active", mode === "terrain");
+  document.getElementById("view-graph").classList.toggle("active", mode === "graph");
+  document.getElementById("graph-controls").style.display = mode === "graph" ? "" : "none";
+  if (mode === "terrain") buildTerrainLegend(state.data.nodes);
+  else buildLegend(state.colorScale);
+  zoom.transform(d3.select(canvas), mode === "terrain" ? state.terrainTransform : state.graphTransform);
+  draw();
+}
+
+let zoom;
+
+async function main() {
+  const response = await fetch("/api/graph");
+  const payload = await response.json();
+
+  renderSummary(payload.summary, payload.nodes.length, payload.edges.length);
+  renderMetrics(payload.summary.metrics);
+
+  resolveEdgeEndpoints(payload.nodes, payload.edges);
+  for (const n of payload.nodes) {
+    const [hx, hy] = hexToPixel(n.q, n.r);
+    n.hx = hx;
+    n.hy = hy;
+  }
+  assignElevationPercentiles(payload.nodes);
+
+  state.data = payload;
+  state.colorScale = colorScaleFor(state.colorBy, payload.nodes);
+
+  resize();
+  const rect = canvas.parentElement.getBoundingClientRect();
+  state.graphTransform = fitTransform(
+    payload.nodes.map((n) => [n.x, n.y]), rect.width, rect.height, 40, true
+  );
+  state.terrainTransform = fitTransform(
+    payload.nodes.map((n) => [n.hx, n.hy]), rect.width, rect.height, 40, false
+  );
+
+  zoom = d3.zoom().on("zoom", (event) => {
+    if (state.viewMode === "terrain") state.terrainTransform = event.transform;
+    else state.graphTransform = event.transform;
+    draw();
+  });
+  d3.select(canvas).call(zoom);
+  setViewMode("terrain");
+
+  status.textContent = "";
+
+  document.getElementById("view-terrain").addEventListener("click", () => setViewMode("terrain"));
+  document.getElementById("view-graph").addEventListener("click", () => setViewMode("graph"));
+
+  document.getElementById("color-by").addEventListener("change", (event) => {
+    state.colorBy = event.target.value;
+    state.highlight = null;
+    state.colorScale = colorScaleFor(state.colorBy, payload.nodes);
+    buildLegend(state.colorScale);
+    draw();
+  });
+  document.getElementById("toggle-same-province").addEventListener("change", (event) => {
+    state.showSameProvince = event.target.checked;
+    draw();
+  });
+  document.getElementById("toggle-boundary").addEventListener("change", (event) => {
+    state.showBoundary = event.target.checked;
+    draw();
+  });
+
+  canvas.addEventListener("mousemove", handleHover);
+  canvas.addEventListener("mouseleave", () => { tooltip.style.display = "none"; });
+}
+
+main().catch((error) => {
+  status.textContent = "failed to load graph: " + error;
+  console.error(error);
+});
+</script>
