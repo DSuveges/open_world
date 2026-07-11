@@ -121,14 +121,14 @@
     <div class="stat"><span>high-elevation clusters</span><span class="v" id="m-high-clusters">-</span></div>
     <div class="stat"><span>&hellip;crossing &gt;1 state</span><span class="v" id="m-high-cross-state">-</span></div>
 
+    <h2>Display</h2>
+    <label>color by
+      <select id="color-by">
+        <option value="elevation">elevation</option>
+        <option value="stateProvince">state / province</option>
+      </select>
+    </label>
     <div id="graph-controls">
-      <h2>Display</h2>
-      <label>color by
-        <select id="color-by">
-          <option value="state">state</option>
-          <option value="province">province</option>
-        </select>
-      </label>
       <label><input type="checkbox" id="toggle-same-province" checked /> same-province edges</label>
       <label><input type="checkbox" id="toggle-boundary" checked /> province/state-crossing edges</label>
     </div>
@@ -156,7 +156,8 @@ const WATER_COLOR = "#081522";
 const state = {
   data: null,
   viewMode: "terrain",
-  colorBy: "state",
+  colorBy: "elevation",
+  colorMode: null,
   showSameProvince: true,
   showBoundary: true,
   graphTransform: d3.zoomIdentity,
@@ -175,10 +176,69 @@ function resize() {
 }
 window.addEventListener("resize", () => { resize(); draw(); });
 
-function colorScaleFor(key, nodes) {
-  const values = Array.from(new Set(nodes.map((n) => n[key]))).sort();
-  const colors = d3.quantize((t) => d3.interpolateRainbow(t), Math.max(values.length, 3));
-  return d3.scaleOrdinal().domain(values).range(colors);
+/** One visually distinct hue per state (golden-angle spacing keeps large
+ *  sets of hues from clustering into look-alike neighbours), and within a
+ *  state, provinces are spread across a lightness band of that same hue --
+ *  so provinces read as "shades of their state's colour" rather than
+ *  unrelated categorical colours. */
+const GOLDEN_ANGLE = 137.508;
+
+function buildHierarchicalScale(nodes) {
+  const provincesByState = new Map();
+  for (const n of nodes) {
+    if (!provincesByState.has(n.state)) provincesByState.set(n.state, new Set());
+    provincesByState.get(n.state).add(n.province);
+  }
+  const states = Array.from(provincesByState.keys()).sort();
+  const stateHue = new Map(states.map((s, i) => [s, (i * GOLDEN_ANGLE) % 360]));
+
+  const lightnessByState = new Map();
+  for (const s of states) {
+    const provinces = Array.from(provincesByState.get(s)).sort();
+    const count = provinces.length;
+    const lightness = new Map();
+    provinces.forEach((p, i) => {
+      lightness.set(p, count === 1 ? 50 : 30 + (i / (count - 1)) * 42);
+    });
+    lightnessByState.set(s, lightness);
+  }
+
+  return {
+    states,
+    colorFor: (n) => {
+      const hue = stateHue.get(n.state);
+      const lightness = lightnessByState.get(n.state).get(n.province);
+      return `hsl(${hue.toFixed(1)}, 62%, ${lightness.toFixed(1)}%)`;
+    },
+    stateColor: (s) => `hsl(${stateHue.get(s).toFixed(1)}, 62%, 50%)`,
+  };
+}
+
+/** Bundles a colour function with how (if at all) clicking the legend
+ *  should isolate nodes, and how to render the legend itself -- so draw()
+ *  and the legend builder don't need to know which mode is active. */
+function computeColorMode(mode, nodes) {
+  if (mode === "elevation") {
+    return {
+      colorFor: (n) => terrainScale(n._pct),
+      highlightField: null,
+      renderLegend: () => buildTerrainLegend(nodes),
+    };
+  }
+  const hierarchical = buildHierarchicalScale(nodes);
+  return {
+    colorFor: hierarchical.colorFor,
+    highlightField: "state",
+    renderLegend: () => buildHierarchicalLegend(hierarchical),
+  };
+}
+
+function applyColorMode(mode) {
+  state.colorBy = mode;
+  state.highlight = null;
+  state.colorMode = computeColorMode(mode, state.data.nodes);
+  state.colorMode.renderLegend();
+  draw();
 }
 
 const terrainScale = d3.scaleLinear()
@@ -211,22 +271,26 @@ function drawHexagon(cx, cy, size) {
   ctx.closePath();
 }
 
-function buildLegend(scale) {
+function buildHierarchicalLegend(hierarchical) {
   const legend = document.getElementById("legend");
   const hint = document.getElementById("legend-hint");
   hint.style.display = "";
   legend.innerHTML = "";
-  for (const value of scale.domain()) {
+  for (const s of hierarchical.states) {
     const row = document.createElement("div");
-    row.className = "row legend-row" + (state.highlight === value ? " active" : "");
-    row.innerHTML = `<span class="swatch" style="background:${scale(value)}"></span><span>${value}</span>`;
+    row.className = "row legend-row" + (state.highlight === s ? " active" : "");
+    row.innerHTML = `<span class="swatch" style="background:${hierarchical.stateColor(s)}"></span><span>${s}</span>`;
     row.addEventListener("click", () => {
-      state.highlight = state.highlight === value ? null : value;
-      buildLegend(scale);
+      state.highlight = state.highlight === s ? null : s;
+      buildHierarchicalLegend(hierarchical);
       draw();
     });
     legend.appendChild(row);
   }
+  const note = document.createElement("div");
+  note.style.cssText = "color: var(--muted); font-size: 11px; margin-top: 8px;";
+  note.textContent = "provinces within a state are lighter/darker shades of the same hue";
+  legend.appendChild(note);
 }
 
 function buildTerrainLegend(nodes) {
@@ -309,7 +373,9 @@ function drawGraphView() {
   ctx.translate(transform.x, transform.y);
   ctx.scale(transform.k, transform.k);
 
-  const isDimmed = (n) => state.highlight !== null && n[state.colorBy] !== state.highlight;
+  const highlightField = state.colorMode.highlightField;
+  const isDimmed = (n) =>
+    state.highlight !== null && highlightField !== null && n[highlightField] !== state.highlight;
 
   // same-province edges are the "local mesh"; everything else crosses a
   // province or state boundary and gets its own colour so repair edges
@@ -337,7 +403,7 @@ function drawGraphView() {
   }
   ctx.setLineDash([]);
 
-  const scale = state.colorScale;
+  const colorFor = state.colorMode.colorFor;
   const radius = 2.5 / transform.k;
   // draw dimmed nodes first so highlighted ones always render on top
   const ordered = state.highlight === null ? nodes : [...nodes].sort((a, b) => isDimmed(b) - isDimmed(a));
@@ -346,7 +412,7 @@ function drawGraphView() {
     ctx.beginPath();
     ctx.arc(n.x, n.y, radius, 0, 2 * Math.PI);
     ctx.globalAlpha = dimmed ? 0.08 : 1;
-    ctx.fillStyle = scale(n[state.colorBy]);
+    ctx.fillStyle = colorFor(n);
     ctx.fill();
   }
   ctx.globalAlpha = 1;
@@ -355,6 +421,7 @@ function drawGraphView() {
 function drawTerrainView() {
   const { nodes } = state.data;
   const transform = state.terrainTransform;
+  const colorFor = state.colorMode.colorFor;
   ctx.fillStyle = WATER_COLOR;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   ctx.translate(transform.x, transform.y);
@@ -364,7 +431,7 @@ function drawTerrainView() {
   const size = HEX_SIZE * 1.02;
   for (const n of nodes) {
     drawHexagon(n.hx, n.hy, size);
-    ctx.fillStyle = terrainScale(n._pct);
+    ctx.fillStyle = colorFor(n);
     ctx.fill();
   }
 }
@@ -459,8 +526,6 @@ function setViewMode(mode) {
   document.getElementById("view-terrain").classList.toggle("active", mode === "terrain");
   document.getElementById("view-graph").classList.toggle("active", mode === "graph");
   document.getElementById("graph-controls").style.display = mode === "graph" ? "" : "none";
-  if (mode === "terrain") buildTerrainLegend(state.data.nodes);
-  else buildLegend(state.colorScale);
   zoom.transform(d3.select(canvas), mode === "terrain" ? state.terrainTransform : state.graphTransform);
   draw();
 }
@@ -483,7 +548,6 @@ async function main() {
   assignElevationPercentiles(payload.nodes);
 
   state.data = payload;
-  state.colorScale = colorScaleFor(state.colorBy, payload.nodes);
 
   resize();
   const rect = canvas.parentElement.getBoundingClientRect();
@@ -500,6 +564,7 @@ async function main() {
     draw();
   });
   d3.select(canvas).call(zoom);
+  applyColorMode(state.colorBy);
   setViewMode("terrain");
 
   status.textContent = "";
@@ -508,11 +573,7 @@ async function main() {
   document.getElementById("view-graph").addEventListener("click", () => setViewMode("graph"));
 
   document.getElementById("color-by").addEventListener("change", (event) => {
-    state.colorBy = event.target.value;
-    state.highlight = null;
-    state.colorScale = colorScaleFor(state.colorBy, payload.nodes);
-    buildLegend(state.colorScale);
-    draw();
+    applyColorMode(event.target.value);
   });
   document.getElementById("toggle-same-province").addEventListener("change", (event) => {
     state.showSameProvince = event.target.checked;
