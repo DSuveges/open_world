@@ -8,11 +8,13 @@ from open_world.data.schema import DISTRICT, DISTRICT_ID, ELEVATION, PROVINCE, S
 from open_world.graph.edge_types import EDGE_KIND
 from open_world.graph.neighbours import (
     DEFAULT_CANDIDATE_POOL,
+    DEFAULT_CROSS_STATE_ELEVATION_PERCENTILE,
     DEFAULT_MAX_DEGREE,
     DEFAULT_MIN_BOUNDARY_FRACTION,
     DEFAULT_MIN_DEGREE,
     DEFAULT_SEED,
     assign_edges,
+    connect_orphans,
     repair_connectivity,
 )
 
@@ -23,6 +25,7 @@ def build_graph(  # noqa: PLR0913 -- each strategy knob is meant to be tunable f
     max_degree: int = DEFAULT_MAX_DEGREE,
     candidate_pool: int = DEFAULT_CANDIDATE_POOL,
     min_boundary_fraction: float = DEFAULT_MIN_BOUNDARY_FRACTION,
+    cross_state_elevation_percentile: float = DEFAULT_CROSS_STATE_ELEVATION_PERCENTILE,
     seed: int = DEFAULT_SEED,
 ) -> nx.Graph:
     """Build the full district neighbour graph.
@@ -45,6 +48,8 @@ def build_graph(  # noqa: PLR0913 -- each strategy knob is meant to be tunable f
             :func:`open_world.graph.neighbours.assign_edges`.
         min_boundary_fraction: Passed through to
             :func:`open_world.graph.neighbours.assign_edges`.
+        cross_state_elevation_percentile: Passed through to
+            :func:`open_world.graph.neighbours.assign_edges`.
         seed: Passed through to
             :func:`open_world.graph.neighbours.assign_edges`.
 
@@ -62,12 +67,14 @@ def build_graph(  # noqa: PLR0913 -- each strategy knob is meant to be tunable f
         max_degree=max_degree,
         candidate_pool=candidate_pool,
         min_boundary_fraction=min_boundary_fraction,
+        cross_state_elevation_percentile=cross_state_elevation_percentile,
         seed=seed,
     )
     for source, target, kind in edges:
         graph.add_edge(source, target, **{EDGE_KIND: kind})
 
     repair_connectivity(graph, frame, max_degree)
+    connect_orphans(graph, frame)
 
     logger.info(
         "assembled graph: {} nodes, {} edges (avg degree {:.2f})",

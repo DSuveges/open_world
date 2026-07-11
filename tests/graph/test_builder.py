@@ -1,6 +1,11 @@
 from open_world.graph.builder import build_graph
 from open_world.graph.edge_types import EDGE_KIND
-from open_world.graph.neighbours import KIND_CROSS_STATE, KIND_SAME_PROVINCE, KIND_SAME_STATE
+from open_world.graph.neighbours import (
+    KIND_CONNECTIVITY_REPAIR,
+    KIND_CROSS_STATE,
+    KIND_SAME_PROVINCE,
+    KIND_SAME_STATE,
+)
 
 
 def test_build_graph_creates_a_node_per_district_with_attributes(make_frame):
@@ -36,9 +41,10 @@ def test_build_graph_every_district_has_a_neighbour(make_frame):
     assert all(degree > 0 for _, degree in graph.degree)
 
 
-def test_build_graph_connects_isolated_districts_across_states(make_frame):
-    # Each district is the sole member of its own province and state, so the
-    # only way either gets a neighbour is the cross-state fallback tier.
+def test_build_graph_connects_isolated_low_elevation_districts_via_fallback(make_frame):
+    # Each district is the sole member of its own province and state, and
+    # both are below the cross-state elevation threshold, so the only way
+    # either gets a neighbour is the orphan-fallback repair.
     frame = make_frame(
         [
             {"state": "s1", "province": "p1", "districtId": "a", "elevation": 10},
@@ -47,6 +53,22 @@ def test_build_graph_connects_isolated_districts_across_states(make_frame):
     )
 
     graph = build_graph(frame)
+
+    assert graph.edges["a", "b"][EDGE_KIND] == KIND_CONNECTIVITY_REPAIR
+
+
+def test_build_graph_connects_isolated_high_elevation_districts_via_cross_state(make_frame):
+    # Both districts are made eligible for the cross-state tier (percentile
+    # 0 disables the elevation filter), so they should link as a mountain
+    # range rather than fall through to the orphan-fallback repair.
+    frame = make_frame(
+        [
+            {"state": "s1", "province": "p1", "districtId": "a", "elevation": 9000},
+            {"state": "s2", "province": "p2", "districtId": "b", "elevation": 9010},
+        ]
+    )
+
+    graph = build_graph(frame, cross_state_elevation_percentile=0.0)
 
     assert graph.edges["a", "b"][EDGE_KIND] == KIND_CROSS_STATE
 

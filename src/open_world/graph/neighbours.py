@@ -19,6 +19,18 @@ filling the rest of its budget locally, so provinces and states stay visibly
 stitched together rather than only touching as a connectivity-repair
 afterthought.
 
+Cross-state edges are further restricted to districts at or above
+``cross_state_elevation_percentile`` -- real mountain ranges cross borders
+at their peaks, not through the lowlands. This also sidesteps a sharp
+random-graph phase transition: letting *every* district roll independently
+for a cross-state edge means, past a small threshold, essentially every
+state ends up connected to every other state (one giant landmass) rather
+than a handful of meaningful mountain bridges. Restricting eligibility to a
+small high-elevation slice, and having a district prefer *extending* a
+neighbour's existing cross-state bridge over starting an unrelated one (see
+``_preferred_cross_state_target``), keeps cross-border connections rare,
+clustered, and thematically about mountains.
+
 This alone gives no connectivity guarantee -- see :func:`repair_connectivity`,
 which must be run afterwards to guarantee every province and state stays a
 single connected region.
@@ -41,6 +53,7 @@ DEFAULT_MIN_DEGREE = 2
 DEFAULT_MAX_DEGREE = 5
 DEFAULT_CANDIDATE_POOL = 8
 DEFAULT_MIN_BOUNDARY_FRACTION = 0.2
+DEFAULT_CROSS_STATE_ELEVATION_PERCENTILE = 0.9
 DEFAULT_SEED = 42
 
 KIND_SAME_PROVINCE = "same-province"
@@ -63,6 +76,8 @@ class _Context:
     province_pool: dict[str, Pool]
     state_pool: dict[str, Pool]
     global_pool: Pool
+    high_elevation_pool: Pool
+    elevation_threshold: float
     max_degree: int
     candidate_pool: int
     rng: random.Random
@@ -70,6 +85,7 @@ class _Context:
     boundary_count: dict[str, int] = field(default_factory=dict)
     boundary_quota: dict[str, int] = field(default_factory=dict)
     neighbours: dict[str, set[str]] = field(default_factory=dict)
+    cross_state_partner: dict[str, str] = field(default_factory=dict)
 
 
 def assign_edges(  # noqa: PLR0913 -- each strategy knob is meant to be tunable from here
@@ -78,6 +94,7 @@ def assign_edges(  # noqa: PLR0913 -- each strategy knob is meant to be tunable 
     max_degree: int = DEFAULT_MAX_DEGREE,
     candidate_pool: int = DEFAULT_CANDIDATE_POOL,
     min_boundary_fraction: float = DEFAULT_MIN_BOUNDARY_FRACTION,
+    cross_state_elevation_percentile: float = DEFAULT_CROSS_STATE_ELEVATION_PERCENTILE,
     seed: int = DEFAULT_SEED,
 ) -> list[tuple[str, str, str]]:
     """Randomly assign each district up to a random number of neighbours.
@@ -97,6 +114,9 @@ def assign_edges(  # noqa: PLR0913 -- each strategy knob is meant to be tunable 
             this, boundary edges only happen when a province runs out of
             its own candidates, which is rare once provinces are reasonably
             large.
+        cross_state_elevation_percentile: Elevation quantile (0-1); only
+            districts at or above it are eligible for cross-state edges, so
+            state borders are only crossed by mountain ranges.
         seed: Random seed, for reproducible runs.
 
     Returns:
@@ -106,7 +126,8 @@ def assign_edges(  # noqa: PLR0913 -- each strategy knob is meant to be tunable 
 
     Raises:
         ValueError: If ``min_degree`` is not a positive integer, exceeds
-            ``max_degree``, or if ``min_boundary_fraction`` is not in [0, 1].
+            ``max_degree``, or if ``min_boundary_fraction`` or
+            ``cross_state_elevation_percentile`` is not in [0, 1].
     """
     if min_degree < 1:
         msg = f"min_degree must be a positive integer, got {min_degree}"
@@ -117,8 +138,17 @@ def assign_edges(  # noqa: PLR0913 -- each strategy knob is meant to be tunable 
     if not 0 <= min_boundary_fraction <= 1:
         msg = f"min_boundary_fraction must be in [0, 1], got {min_boundary_fraction}"
         raise ValueError(msg)
+    if not 0 <= cross_state_elevation_percentile <= 1:
+        msg = (
+            "cross_state_elevation_percentile must be in [0, 1], "
+            f"got {cross_state_elevation_percentile}"
+        )
+        raise ValueError(msg)
 
     ids = frame[DISTRICT_ID].to_list()
+    elevation_threshold = float(
+        frame[ELEVATION].quantile(cross_state_elevation_percentile, interpolation="linear")
+    )
     ctx = _Context(
         province_of=dict(zip(ids, frame[PROVINCE].to_list(), strict=True)),
         state_of=dict(zip(ids, frame[STATE].to_list(), strict=True)),
@@ -126,6 +156,10 @@ def assign_edges(  # noqa: PLR0913 -- each strategy knob is meant to be tunable 
         province_pool=_build_pool(frame, PROVINCE),
         state_pool=_build_pool(frame, STATE),
         global_pool=_sorted_ids_elevations(frame),
+        high_elevation_pool=_sorted_ids_elevations(
+            frame.filter(pl.col(ELEVATION) >= elevation_threshold)
+        ),
+        elevation_threshold=elevation_threshold,
         max_degree=max_degree,
         candidate_pool=candidate_pool,
         degree=dict.fromkeys(ids, 0),
@@ -155,15 +189,19 @@ def assign_edges(  # noqa: PLR0913 -- each strategy knob is meant to be tunable 
             if kind in BOUNDARY_KINDS:
                 ctx.boundary_count[district] += 1
                 ctx.boundary_count[candidate] += 1
+            if kind == KIND_CROSS_STATE:
+                ctx.cross_state_partner[district] = ctx.state_of[candidate]
+                ctx.cross_state_partner[candidate] = ctx.state_of[district]
 
     logger.info(
         "assigned {} randomized edges (min_degree={}, max_degree={}, candidate_pool={}, "
-        "min_boundary_fraction={}, seed={})",
+        "min_boundary_fraction={}, cross_state_elevation_percentile={}, seed={})",
         len(edges),
         min_degree,
         max_degree,
         candidate_pool,
         min_boundary_fraction,
+        cross_state_elevation_percentile,
         seed,
     )
     return edges
@@ -200,6 +238,40 @@ def _select_neighbours(district: str, needed: int, ctx: _Context) -> list[tuple[
     def other_state(candidate: str) -> bool:
         return is_free(candidate) and ctx.state_of[candidate] != state
 
+    def cross_state_candidates(count: int) -> list[str]:
+        """High-elevation-only search.
+
+        Prefers extending a neighbour's existing cross-state bridge over
+        starting an unrelated one.
+        """
+        if count <= 0 or elevation < ctx.elevation_threshold:
+            return []
+        found: list[str] = []
+        preferred_state = _preferred_cross_state_target(district, ctx)
+        if preferred_state is not None:
+            preferred = _random_nearest(
+                ctx.high_elevation_pool,
+                elevation,
+                lambda c: other_state(c) and ctx.state_of[c] == preferred_state,
+                ctx.candidate_pool,
+                count,
+                ctx.rng,
+            )
+            found.extend(preferred)
+            excluded.update(preferred)
+        if len(found) < count:
+            found.extend(
+                _random_nearest(
+                    ctx.high_elevation_pool,
+                    elevation,
+                    other_state,
+                    ctx.candidate_pool,
+                    count - len(found),
+                    ctx.rng,
+                )
+            )
+        return found
+
     picked: list[tuple[str, str]] = []
 
     quota_remaining = max(0, ctx.boundary_quota.get(district, 0) - ctx.boundary_count[district])
@@ -218,9 +290,7 @@ def _select_neighbours(district: str, needed: int, ctx: _Context) -> list[tuple[
 
         still_needed = boundary_needed - len(forced_state)
         if still_needed > 0:
-            forced_cross = _random_nearest(
-                ctx.global_pool, elevation, other_state, ctx.candidate_pool, still_needed, ctx.rng
-            )
+            forced_cross = cross_state_candidates(still_needed)
             picked.extend((candidate, KIND_CROSS_STATE) for candidate in forced_cross)
             excluded.update(forced_cross)
 
@@ -249,17 +319,28 @@ def _select_neighbours(district: str, needed: int, ctx: _Context) -> list[tuple[
         excluded.update(tier2)
 
     if len(picked) < needed:
-        tier3 = _random_nearest(
-            ctx.global_pool,
-            elevation,
-            other_state,
-            ctx.candidate_pool,
-            needed - len(picked),
-            ctx.rng,
-        )
+        tier3 = cross_state_candidates(needed - len(picked))
         picked.extend((candidate, KIND_CROSS_STATE) for candidate in tier3)
 
     return picked
+
+
+def _preferred_cross_state_target(district: str, ctx: _Context) -> str | None:
+    """Check whether any of `district`'s current neighbours already bridges to another state.
+
+    Args:
+        district: DistrictId to check.
+        ctx: Shared lookups and live neighbour/cross-state-partner state.
+
+    Returns:
+        The state name to prefer bridging to, or None if no neighbour has an
+        existing cross-state connection.
+    """
+    for neighbour in ctx.neighbours[district]:
+        partner_state = ctx.cross_state_partner.get(neighbour)
+        if partner_state is not None:
+            return partner_state
+    return None
 
 
 def _build_pool(frame: pl.DataFrame, group_col: str) -> dict[str, Pool]:
@@ -355,6 +436,42 @@ def _random_nearest(  # noqa: PLR0913 -- each arg is independently necessary her
     if len(nearby) <= count:
         return nearby
     return rng.sample(nearby, count)
+
+
+def connect_orphans(graph: nx.Graph, frame: pl.DataFrame) -> None:
+    """Guarantee every district has at least one neighbour.
+
+    A district that is the sole member of both its province and its state
+    has no repair partner (:func:`repair_connectivity` only merges
+    *multiple* components within the same group; a lone node is trivially
+    "connected" on its own) and, if its elevation is below the cross-state
+    threshold, no cross-state fallback either. This is the true last
+    resort: connect any remaining degree-0 district to its nearest
+    elevation neighbour, dataset-wide, ignoring every other constraint.
+
+    Args:
+        graph: Graph to mutate in place.
+        frame: District table, used to find each orphan's nearest elevation
+            neighbour.
+    """
+    orphans = [node for node, degree in graph.degree if degree == 0]
+    if not orphans:
+        return
+
+    ids, elevations = _sorted_ids_elevations(frame)
+    index_by_id = {node_id: index for index, node_id in enumerate(ids)}
+
+    for node in orphans:
+        index = index_by_id[node]
+        candidates = [i for i in (index - 1, index + 1) if 0 <= i < len(ids)]
+        nearest = min(candidates, key=lambda i: abs(elevations[i] - elevations[index]))
+        graph.add_edge(node, ids[nearest], **{EDGE_KIND: KIND_CONNECTIVITY_REPAIR})
+
+    logger.warning(
+        "{} districts had no same-group or cross-state neighbours; "
+        "connected them to their nearest elevation neighbour as a fallback",
+        len(orphans),
+    )
 
 
 def repair_connectivity(graph: nx.Graph, frame: pl.DataFrame, max_degree: int) -> None:

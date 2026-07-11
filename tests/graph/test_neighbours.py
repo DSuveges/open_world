@@ -1,3 +1,5 @@
+import random
+
 import networkx as nx
 import pytest
 
@@ -8,9 +10,29 @@ from open_world.graph.neighbours import (
     KIND_SAME_PROVINCE,
     KIND_SAME_STATE,
     _closest_pair,
+    _Context,
+    _preferred_cross_state_target,
     assign_edges,
     repair_connectivity,
 )
+
+
+def _minimal_context(neighbours: dict, cross_state_partner: dict) -> _Context:
+    return _Context(
+        province_of={},
+        state_of={},
+        elevation_of={},
+        province_pool={},
+        state_pool={},
+        global_pool=([], []),
+        high_elevation_pool=([], []),
+        elevation_threshold=0.0,
+        max_degree=5,
+        candidate_pool=8,
+        rng=random.Random(0),  # noqa: S311 -- test fixture randomness, not a security context
+        neighbours=neighbours,
+        cross_state_partner=cross_state_partner,
+    )
 
 
 def test_assign_edges_rejects_non_positive_min_degree(make_frame):
@@ -32,6 +54,13 @@ def test_assign_edges_rejects_out_of_range_boundary_fraction(make_frame):
 
     with pytest.raises(ValueError, match="min_boundary_fraction must be in"):
         assign_edges(frame, min_boundary_fraction=1.5)
+
+
+def test_assign_edges_rejects_out_of_range_cross_state_elevation_percentile(make_frame):
+    frame = make_frame([{"state": "s1", "province": "p1", "districtId": "a", "elevation": 10}])
+
+    with pytest.raises(ValueError, match="cross_state_elevation_percentile must be in"):
+        assign_edges(frame, cross_state_elevation_percentile=1.5)
 
 
 def test_assign_edges_prefers_same_province_when_enough_candidates(make_frame):
@@ -255,3 +284,41 @@ def test_closest_pair_finds_the_smallest_elevation_gap():
     pair = _closest_pair({"a1", "a2"}, {"b1", "b2"}, elevation_of)
 
     assert pair == ("a2", "b1")
+
+
+def test_preferred_cross_state_target_extends_a_neighbours_existing_bridge():
+    ctx = _minimal_context(neighbours={"x": {"y", "z"}}, cross_state_partner={"y": "s2", "z": "s3"})
+
+    target = _preferred_cross_state_target("x", ctx)
+
+    assert target in {"s2", "s3"}  # whichever bridged neighbour is checked first
+
+
+def test_preferred_cross_state_target_returns_none_without_a_bridged_neighbour():
+    ctx = _minimal_context(neighbours={"x": {"y"}}, cross_state_partner={})
+
+    assert _preferred_cross_state_target("x", ctx) is None
+
+
+def test_assign_edges_cross_state_edges_only_involve_high_elevation_districts(make_frame):
+    rows = [
+        {"state": "s1", "province": "p1", "districtId": f"s1-{i}", "elevation": i * 10}
+        for i in range(20)
+    ]
+    rows += [
+        {"state": "s2", "province": "p2", "districtId": f"s2-{i}", "elevation": i * 10}
+        for i in range(20)
+    ]
+    frame = make_frame(rows)
+
+    edges = assign_edges(
+        frame, min_boundary_fraction=1.0, cross_state_elevation_percentile=0.9, seed=3
+    )
+    threshold = frame["elevation"].quantile(0.9, interpolation="linear")
+    elevation_of = dict(zip(frame["districtId"], frame["elevation"], strict=True))
+
+    cross_state_edges = [(u, v) for u, v, kind in edges if kind == KIND_CROSS_STATE]
+    assert cross_state_edges  # sanity: this scenario actually produced some
+    for source, target in cross_state_edges:
+        assert elevation_of[source] >= threshold
+        assert elevation_of[target] >= threshold
